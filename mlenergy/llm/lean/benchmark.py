@@ -1,10 +1,9 @@
 """Lean LLM benchmark — orchestration, request dispatch, and result collection.
 
-Entry point::
+Usage::
 
-    async def main(config: BenchmarkConfig, requests: list[SampleRequest]) -> BenchmarkResult:
-        async with Benchmark(config, output_dir) as bm:
-            return await bm.run(requests)
+    async with Benchmark(config, output_dir, max_num_seqs, tokenizer) as bm:
+        result = await bm.run(requests)
 
 The Benchmark context manager composes all sub-managers (vLLM container,
 Prometheus scraper, aiohttp session) via AsyncExitStack so cleanup is always
@@ -489,26 +488,3 @@ class Benchmark:
         if not output.success:
             output.error = "No valid chunks received — response produced no tokens."
         return output
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
-async def main(
-    config: BenchmarkConfig,
-    requests: list[SampleRequest],
-    output_dir: Path,
-    max_num_seqs: int,
-    tokenizer: PreTrainedTokenizerBase,
-    max_num_batched_tokens: int | None = None,
-) -> BenchmarkResult:
-    async with Benchmark(
-        config=config,
-        output_dir=output_dir,
-        max_num_seqs=max_num_seqs,
-        tokenizer=tokenizer,
-        max_num_batched_tokens=max_num_batched_tokens,
-    ) as bm:
-        return await bm.run(requests)
