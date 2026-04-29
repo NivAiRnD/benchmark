@@ -219,6 +219,10 @@ class VLLMManager:
         if self._watch_task is not None:
             await self._watch_task
 
+    @property
+    def ready_event(self) -> asyncio.Event:
+        return self._ready_event
+
     async def wait_ready(self) -> None:
         """Wait for vLLM to signal startup. Raises on timeout or detected crash."""
         ready_task = asyncio.create_task(self._ready_event.wait())
@@ -261,7 +265,7 @@ class VLLMManager:
                 log_file.write(line)
                 log_file.flush()
 
-                if _STARTUP_STRING in line:
+                if _STARTUP_STRING in line and not self._ready_event.is_set():
                     logger.info("vLLM startup detected: %s", line.rstrip())
                     self._ready_event.set()
 

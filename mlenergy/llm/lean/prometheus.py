@@ -43,9 +43,15 @@ class PrometheusCollector:
         )
     """
 
-    def __init__(self, metrics_url: str, interval: float = 1.0) -> None:
+    def __init__(
+        self,
+        metrics_url: str,
+        interval: float = 1.0,
+        ready_event: asyncio.Event | None = None,
+    ) -> None:
         self._metrics_url = metrics_url
         self._interval = interval
+        self._ready_event = ready_event
         self._timeline: list[Snapshot] = []
         self._stop: asyncio.Event | None = None
         self._collect_task: asyncio.Task[None] | None = None
@@ -178,6 +184,8 @@ class PrometheusCollector:
 
     async def _collect(self) -> None:
         assert self._stop is not None and self._session is not None
+        if self._ready_event is not None:
+            await self._ready_event.wait()
         while not self._stop.is_set():
             try:
                 async with self._session.get(self._metrics_url) as resp:
