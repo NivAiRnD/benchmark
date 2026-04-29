@@ -49,15 +49,73 @@ _AIOHTTP_TIMEOUT: Final[aiohttp.ClientTimeout] = aiohttp.ClientTimeout(
 )
 _PROMETHEUS_INTERVAL_S: Final[float] = 1.0
 _POWER_SAMPLE_INTERVAL_S: Final[float] = 0.1
+_CPU_POWER_SAMPLE_INTERVAL_S: Final[float] = 0.1
 
 
 # ---------------------------------------------------------------------------
-# Power sampler
+# Power samplers
 # ---------------------------------------------------------------------------
+
+
+class CPUPowerSampler:
+    """Polls CPU power via RAPL at a fixed interval.
+
+    Records (seconds_since_start, watts) pairs. Power is computed as
+    delta-energy / delta-time between consecutive RAPL reads so no direct
+    instantaneous-power API is needed.
+    """
+
+    def __init__(self, zeus: ZeusMonitor, interval: float = _CPU_POWER_SAMPLE_INTERVAL_S) -> None:
+        self._zeus = zeus
+        self._interval = interval
+        self._start: float = 0.0
+        self._trace: list[tuple[float, float]] = []
+        self._stop: asyncio.Event = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._prev_energy_j: float = 0.0
+        self._prev_time: float = 0.0
+
+    async def __aenter__(self) -> CPUPowerSampler:
+        self._start = time.time()
+        self._stop = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        self._prev_energy_j = await loop.run_in_executor(None, self._read_energy_j)
+        self._prev_time = time.time()
+        self._task = asyncio.create_task(self._poll())
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._stop.set()
+        if self._task is not None:
+            await self._task
+
+    async def _poll(self) -> None:
+        loop = asyncio.get_event_loop()
+        while not self._stop.is_set():
+            await asyncio.sleep(self._interval)
+            t = time.time()
+            energy_j = await loop.run_in_executor(None, self._read_energy_j)
+            dt = t - self._prev_time
+            if dt > 0:
+                self._trace.append((t - self._start, (energy_j - self._prev_energy_j) / dt))
+            self._prev_energy_j = energy_j
+            self._prev_time = t
+
+    def _read_energy_j(self) -> float:
+        if not self._zeus.cpu_indices:
+            return 0.0
+        return sum(
+            self._zeus.cpus.get_total_energy_consumption(i).cpu_mj / 1000.0
+            for i in self._zeus.cpu_indices
+        )
+
+    @property
+    def trace(self) -> list[tuple[float, float]]:
+        return list(self._trace)
 
 
 class PowerSampler:
-    """Async context manager that polls instant GPU power at a fixed interval.
+    """Polls instant GPU power at a fixed interval.
 
     Records (seconds_since_start, watts) pairs from __aenter__ until __aexit__.
     Uses Zeus's GPU interface so CUDA_VISIBLE_DEVICES is respected.
@@ -125,22 +183,28 @@ class BenchmarkDependencies:
     """All sub-managers for a benchmark run.
 
     Access by name: deps.zeus, deps.prometheus, deps.session, deps.vllm
-    Enter context managers via deps.managed — zeus is excluded (not a CM).
+    Enter context managers via deps.managed — zeus and samplers are excluded (not long-lived CMs).
     """
 
     vllm: VLLMManager
     prometheus: PrometheusCollector
     session: aiohttp.ClientSession
     zeus: ZeusMonitor
+    power_sampler: PowerSampler
+    cpu_sampler: CPUPowerSampler | None  # None when monitor_cpu_power=False
+
+    @property
+    def managed(self) -> tuple[VLLMManager, PrometheusCollector, aiohttp.ClientSession]:
+        """Async context managers in enter order (LIFO cleanup: session, prometheus, vllm)."""
+        return (self.vllm, self.prometheus, self.session)
 
 
 @dataclass
 class _RunContext:
     """Async context manager for a single benchmark run.
 
-    __aenter__: records start time, opens Zeus energy window, starts power sampler.
-    __aexit__:  stops power sampler, closes Zeus window — measurement only, no analysis.
-    build_result: offline step — computes metrics and returns BenchmarkResult.
+    __aenter__: records start time, opens Zeus energy window.
+    __aexit__:  closes Zeus window, computes metrics, builds BenchmarkResult, validates completion.
     """
 
     tracker: RequestTracker
@@ -150,16 +214,15 @@ class _RunContext:
     deps: BenchmarkDependencies
     tokenizer: PreTrainedTokenizerBase
     outputs: list[RequestOutput] = field(default_factory=list)
+    result: BenchmarkResult | None = None
     _benchmark_start: float = field(default=0.0, init=False)
-    _benchmark_end: float = field(default=0.0, init=False)
-    _zeus_measurement: Any = field(default=None, init=False)
-    _power_sampler: PowerSampler | None = field(default=None, init=False)
 
     async def __aenter__(self) -> _RunContext:
         self._benchmark_start = time.time()
         self.deps.zeus.begin_window("benchmark", sync_execution=False)
-        self._power_sampler = PowerSampler(self.deps.zeus)
-        await self._power_sampler.__aenter__()
+        await self.deps.power_sampler.__aenter__()
+        if self.deps.cpu_sampler is not None:
+            await self.deps.cpu_sampler.__aenter__()
         return self
 
     async def __aexit__(
@@ -168,29 +231,31 @@ class _RunContext:
         _exc_val: BaseException | None,
         _exc_tb: object,
     ) -> None:
-        if self._power_sampler is not None:
-            await self._power_sampler.__aexit__(None, None, None)
-        self._zeus_measurement = self.deps.zeus.end_window("benchmark", sync_execution=False)
-        self._benchmark_end = time.time()
+        await self.deps.power_sampler.__aexit__(None, None, None)
+        if self.deps.cpu_sampler is not None:
+            await self.deps.cpu_sampler.__aexit__(None, None, None)
+        zeus_measurement = self.deps.zeus.end_window("benchmark", sync_execution=False)
+        benchmark_end = time.time()
 
-    def build_result(self) -> BenchmarkResult:
         metrics, completed, _ = calculate_metrics(
             requests=self.requests,
             outputs=self.outputs,
             tokenizer=self.tokenizer,
-            duration_s=self._benchmark_end - self._benchmark_start,
+            duration_s=benchmark_end - self._benchmark_start,
         )
 
-        energy_j = sum(self._zeus_measurement.gpu_energy.values())
-        result = BenchmarkResult(
+        energy_j = sum(zeus_measurement.gpu_energy.values())
+        power_trace = self.deps.power_sampler.trace
+        cpu_power_trace = self.deps.cpu_sampler.trace if self.deps.cpu_sampler else []
+        self.result = BenchmarkResult(
             metrics=metrics,
             energy_j=energy_j,
             energy_per_token_j=energy_j / (self.tracker.tokens_generated or 1),
             benchmark_start_time=self._benchmark_start,
-            benchmark_end_time=self._benchmark_end,
+            benchmark_end_time=benchmark_end,
             prometheus_stats=self.deps.prometheus.calculate_stats(
                 window_start=self._benchmark_start,
-                window_end=self._benchmark_end,
+                window_end=benchmark_end,
                 gauge_metrics={
                     "vllm:num_requests_running": "sum",
                     "vllm:kv_cache_usage_perc": "avg",
@@ -203,17 +268,16 @@ class _RunContext:
                 ],
             ),
             per_request=self.outputs,
-            power_trace=self._power_sampler.trace if self._power_sampler else [],
+            power_trace=power_trace,
+            cpu_power_trace=cpu_power_trace,
         )
-        result.log()
+        self.result.log()
 
         if completed < len(self.requests):
             raise RuntimeError(
                 f"Only {completed}/{len(self.requests)} requests completed. "
                 "Treating run as failed."
             )
-
-        return result
 
 
 # ---------------------------------------------------------------------------
@@ -309,12 +373,13 @@ class Benchmark:
         max_num_seqs: int,
         tokenizer: PreTrainedTokenizerBase,
         max_num_batched_tokens: int | None = None,
+        monitor_cpu_power: bool = False,
     ) -> None:
         self._config = config
         self._tokenizer = tokenizer
-
         log_path = output_dir / "server.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        zeus = ZeusMonitor()
         self._deps = BenchmarkDependencies(
             vllm=VLLMManager(
                 config=config.server,
@@ -332,17 +397,18 @@ class Benchmark:
                     limit=0, ssl=False, keepalive_timeout=6 * 60 * 60
                 ),
             ),
-            zeus=ZeusMonitor(),
+            zeus=zeus,
+            power_sampler=PowerSampler(zeus),
+            cpu_sampler=CPUPowerSampler(zeus) if monitor_cpu_power else None,
         )
         self._stack: contextlib.AsyncExitStack | None = None
 
     async def __aenter__(self) -> "Benchmark":
         self._stack = contextlib.AsyncExitStack()
         await self._stack.__aenter__()
-        await self._stack.enter_async_context(self._deps.vllm)
+        for dep in self._deps.managed:
+            await self._stack.enter_async_context(dep)
         await self._deps.vllm.wait_ready()
-        await self._stack.enter_async_context(self._deps.prometheus)
-        await self._stack.enter_async_context(self._deps.session)
         return self
 
     async def __aexit__(
@@ -376,7 +442,8 @@ class Benchmark:
             start_event.set()
             ctx.outputs = list(await asyncio.gather(*tasks))
 
-        return ctx.build_result()
+        assert ctx.result is not None
+        return ctx.result
 
     @contextlib.asynccontextmanager
     async def _measurement_window(

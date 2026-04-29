@@ -76,6 +76,7 @@ class BenchmarkResult:
     prometheus_stats: dict[str, float]
     per_request: list[RequestOutput]
     power_trace: list[tuple[float, float]] = field(default_factory=list)
+    cpu_power_trace: list[tuple[float, float]] = field(default_factory=list)
 
     def log(self) -> None:
         """Log all metrics and energy to the benchmark logger."""

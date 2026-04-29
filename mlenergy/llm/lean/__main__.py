@@ -84,6 +84,7 @@ class Args(Generic[WorkloadT]):
 
     # Run control
     overwrite_results: bool = False
+    monitor_cpu_power: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +169,7 @@ def _save_result(result_file: Path, args: Args, workload: WorkloadConfig, result
         "energy_per_token_j": result.energy_per_token_j,
         "prometheus_stats": result.prometheus_stats,
         "power_trace": result.power_trace,
+        "cpu_power_trace": result.cpu_power_trace,
         "per_request": [
             {
                 "ttft": o.ttft,
@@ -230,6 +232,7 @@ def main(args: Args) -> None:
             max_num_seqs=workload.max_num_seqs,
             tokenizer=workload.tokenizer,
             max_num_batched_tokens=workload.max_num_batched_tokens,
+            monitor_cpu_power=args.monitor_cpu_power,
         ) as bm:
             return await bm.run(requests)
 
