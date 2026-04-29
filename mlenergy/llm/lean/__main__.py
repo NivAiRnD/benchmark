@@ -167,6 +167,16 @@ def _save_result(result_file: Path, args: Args, workload: WorkloadConfig, result
         "energy_j": result.energy_j,
         "energy_per_token_j": result.energy_per_token_j,
         "prometheus_stats": result.prometheus_stats,
+        "power_trace": result.power_trace,
+        "per_request": [
+            {
+                "ttft": o.ttft,
+                "latency": o.latency,
+                "output_tokens": o.output_tokens,
+                "success": o.success,
+            }
+            for o in result.per_request
+        ],
     }
     with open(result_file, "w") as f:
         json.dump(data, f, indent=2)
