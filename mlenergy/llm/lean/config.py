@@ -8,7 +8,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final, Literal, TypeAlias
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias
+
+if TYPE_CHECKING:
+    from mlenergy.llm.lean.__main__ import Args
+    from mlenergy.llm.workloads import WorkloadConfig
 
 logger = logging.getLogger("mlenergy.llm.lean")
 
@@ -101,3 +105,41 @@ class BenchmarkConfig:
     traffic: TrafficConfig
     sampling: SamplingConfig
     seed: int = 42
+
+
+def build_config(args: Args, workload: WorkloadConfig, gpu_ids: list[int]) -> BenchmarkConfig:
+    from mlenergy.llm.config import load_extra_body, load_system_prompt
+
+    extra_body = load_extra_body(
+        model_id=workload.model_id,
+        gpu_model=workload.gpu_model,
+        workload=workload.normalized_name,
+    )
+    system_prompt = load_system_prompt(
+        model_id=workload.model_id,
+        gpu_model=workload.gpu_model,
+        workload=workload.normalized_name,
+    )
+    return BenchmarkConfig(
+        server=ServerConfig(
+            model_id=workload.model_id,
+            gpu_model=workload.gpu_model,
+            workload=workload.normalized_name,
+            gpu_ids=gpu_ids,
+            image=args.server_image,
+        ),
+        traffic=TrafficConfig(
+            request_rate=args.request_rate,
+            burstiness=args.burstiness,
+            max_concurrency=args.max_concurrency,
+            max_output_tokens=args.max_output_tokens,
+            ignore_eos=args.ignore_eos,
+        ),
+        sampling=SamplingConfig(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            extra_body=extra_body,
+            system_prompt=system_prompt,
+        ),
+        seed=workload.seed,
+    )

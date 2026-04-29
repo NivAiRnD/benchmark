@@ -6,9 +6,12 @@ raw request outputs into aggregate statistics.
 
 from __future__ import annotations
 
+import json
 import logging
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
@@ -17,6 +20,8 @@ from mlenergy.llm.datasets import SampleRequest
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    from mlenergy.llm.lean.__main__ import Args
+    from mlenergy.llm.workloads import WorkloadConfig
 
 logger = logging.getLogger("mlenergy.llm.lean")
 
@@ -171,3 +176,44 @@ def calculate_metrics(
         "P99 E2EL (ms)": MetricEntry(_p(e2els, 99)),
     }
     return BenchmarkMetrics(entries=entries), completed, actual_output_lens
+
+
+def save_result(
+    result_file: Path,
+    args: Args,
+    workload: WorkloadConfig,
+    result: BenchmarkResult,
+) -> None:
+    data = {
+        "date": datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "model_id": workload.model_id,
+        "gpu_model": workload.gpu_model,
+        "num_gpus": workload.num_gpus,
+        "num_requests": workload.num_requests,
+        "num_request_repeats": workload.num_request_repeats,
+        "seed": workload.seed,
+        "max_num_seqs": workload.max_num_seqs,
+        "max_num_batched_tokens": workload.max_num_batched_tokens,
+        "request_rate": args.request_rate if args.request_rate < float("inf") else "inf",
+        "burstiness": args.burstiness,
+        "max_concurrency": args.max_concurrency,
+        "max_output_tokens": args.max_output_tokens,
+        "metrics": {label: entry.value for label, entry in result.metrics.entries.items()},
+        "energy_j": result.energy_j,
+        "energy_per_token_j": result.energy_per_token_j,
+        "prometheus_stats": result.prometheus_stats,
+        "power_trace": result.power_trace,
+        "cpu_power_trace": result.cpu_power_trace,
+        "per_request": [
+            {
+                "ttft": o.ttft,
+                "latency": o.latency,
+                "output_tokens": o.output_tokens,
+                "success": o.success,
+            }
+            for o in result.per_request
+        ],
+    }
+    with open(result_file, "w") as f:
+        json.dump(data, f, indent=2)
+    logger.info("Saved results to %s", result_file)
