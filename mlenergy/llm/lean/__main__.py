@@ -1,12 +1,17 @@
 """CLI entry point for the lean LLM benchmark.
 
-Usage::
+Usage with TOML config::
 
     sudo PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 \\
       HF_TOKEN="$HF_TOKEN" HF_HOME="$HF_HOME" \\
       .venv/bin/python -m mlenergy.llm.lean \\
-      --server-image vllm/vllm-openai:latest \\
-      --max-output-tokens 128 \\
+      --config configs/vllm/lm-arena-chat/Qwen/Qwen3-8B/B200/bench.toml
+
+Usage with CLI args::
+
+    sudo PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 \\
+      HF_TOKEN="$HF_TOKEN" HF_HOME="$HF_HOME" \\
+      .venv/bin/python -m mlenergy.llm.lean \\
       workload:lm-arena-chat \\
         --workload.base-dir run/llm \\
         --workload.model-id Qwen/Qwen3-8B \\
@@ -17,17 +22,18 @@ Usage::
 
 Monitor in a second terminal::
 
-    find run/llm/lean -name "server.log" | xargs tail -f
+    find run/llm -name "server.log" | xargs tail -f
 """
-
-from __future__ import annotations
 
 import asyncio
 import gc
 import logging
 import os
 import resource
+import tomllib
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Generic, Literal, TypeVar
 
 import tyro
@@ -35,17 +41,24 @@ import tyro
 from mlenergy.llm.lean.benchmark import Benchmark
 from mlenergy.llm.lean.config import BenchmarkConfig
 from mlenergy.llm.lean.metrics import BenchmarkResult
-from mlenergy.llm.workloads import (
+from mlenergy.llm.lean.workloads import (
     GPQA,
-    LengthControl,
     LMArenaChat,
+    LengthControl,
+    LeanWorkloadMixin,
     SourcegraphFIM,
-    WorkloadConfig,
 )
 
-WorkloadT = TypeVar("WorkloadT", bound=WorkloadConfig)
+WorkloadT = TypeVar("WorkloadT", bound=LeanWorkloadMixin)
 
 logger = logging.getLogger("mlenergy.llm.lean")
+
+_WORKLOAD_TYPES: dict[str, type[LeanWorkloadMixin]] = {
+    "lm-arena-chat": LMArenaChat,
+    "length-control": LengthControl,
+    "sourcegraph-fim": SourcegraphFIM,
+    "gpqa": GPQA,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -57,24 +70,27 @@ logger = logging.getLogger("mlenergy.llm.lean")
 class Args(Generic[WorkloadT]):
     """CLI arguments for the lean LLM benchmark."""
 
-    workload: WorkloadT
+    # Optional TOML config file; provides workload + benchmark defaults
+    config: Path | None = None
 
-    # Server
-    server_image: str = "vllm/vllm-openai:latest"
+    # Workload subcommand — optional when --config provides [workload]
+    workload: WorkloadT | None = None
+
+    # Server — None means "use config file value or built-in default"
+    server_image: str | None = None
 
     # Traffic
-    request_rate: float = float("inf")
-    burstiness: float = 1.0
+    request_rate: float | None = None
+    burstiness: float | None = None
     max_concurrency: int | None = None
     max_output_tokens: int | Literal["dataset"] | None = None
-    ignore_eos: bool = False
+    ignore_eos: bool | None = None
 
     # Sampling
-    temperature: float = 0.8
-    top_p: float = 0.95
+    temperature: float | None = None
+    top_p: float | None = None
 
-    # Run control
-    overwrite_results: bool = False
+    # Run control (not in TOML)
     monitor_cpu_power: bool = False
 
 
@@ -83,40 +99,44 @@ class Args(Generic[WorkloadT]):
 # ---------------------------------------------------------------------------
 
 
+def _workload_from_toml(data: dict) -> LeanWorkloadMixin:
+    data = dict(data)
+    cls = _WORKLOAD_TYPES[data.pop("type")]
+    return cls(**data)
+
+
 def main(args: Args) -> None:
-    assert isinstance(args.workload, WorkloadConfig)
-    workload = args.workload
+    if args.workload is not None:
+        workload = args.workload
+    elif args.config is not None:
+        with open(args.config, "rb") as f:
+            toml_data = tomllib.load(f)
+        if "workload" not in toml_data:
+            raise ValueError(f"--config provided but [{args.config}] has no [workload] section")
+        workload = _workload_from_toml(toml_data["workload"])
+    else:
+        raise ValueError("Must provide either a workload subcommand or --config with a [workload] section")
 
     gpu_ids = [int(g) for g in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
     if len(gpu_ids) != workload.num_gpus:
         raise ValueError(
-            f"--workload.num-gpus={workload.num_gpus} does not match "
+            f"workload.num_gpus={workload.num_gpus} does not match "
             f"CUDA_VISIBLE_DEVICES ({len(gpu_ids)} GPUs: {os.environ['CUDA_VISIBLE_DEVICES']})"
         )
 
-    output_dir = workload.base_dir / "lean" / workload.normalized_name / workload.model_id / workload.gpu_model
-    result_file = output_dir / "results.json"
+    workload.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    if result_file.exists() and not args.overwrite_results:
-        print(
-            f"Result file {result_file} already exists. Exiting. "
-            "Pass --overwrite-results to rerun."
-        )
-        raise SystemExit(0)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(output_dir / "driver.log", mode="w"),
+            logging.FileHandler(workload.to_path(of="driver_log"), mode="w"),
         ],
     )
     logger.info("%s", args)
 
-    # Raise open-file limit so many concurrent connections don't hit EMFILE
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(65535, hard), hard))
 
@@ -129,7 +149,7 @@ def main(args: Args) -> None:
     async def _run() -> BenchmarkResult:
         async with Benchmark(
             config=config,
-            output_dir=output_dir,
+            output_dir=workload.run_dir,
             max_num_seqs=workload.max_num_seqs,
             tokenizer=workload.tokenizer,
             max_num_batched_tokens=workload.max_num_batched_tokens,
@@ -139,7 +159,9 @@ def main(args: Args) -> None:
 
     result = asyncio.run(_run())
 
-    result.save(result_file, args, workload)
+    output_dir = workload.run_dir
+    task_dir = workload.base_dir / workload.normalized_name
+    result.save(output_dir, task_dir, config, workload, workload.run_id)
 
 
 if __name__ == "__main__":

@@ -11,14 +11,13 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import Any, Literal
 
 import aiohttp
 
-logger = logging.getLogger("mlenergy.llm.lean")
+from mlenergy.llm.lean.constants import _DEFAULT_PERCENTILES, _SCRAPE_TIMEOUT_S
 
-_SCRAPE_TIMEOUT_S: Final[float] = 5.0
-_DEFAULT_PERCENTILES: Final[tuple[float, ...]] = (50.0, 90.0, 95.0, 99.0)
+logger = logging.getLogger("mlenergy.llm.lean")
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import sys
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,10 +19,11 @@ from typing import Any, TYPE_CHECKING
 import numpy as np
 
 from mlenergy.llm.datasets import SampleRequest
+from mlenergy.llm.lean.request import RequestOutput
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-    from mlenergy.llm.lean.__main__ import Args
+    from mlenergy.llm.lean.config import BenchmarkConfig
     from mlenergy.llm.workloads import WorkloadConfig
 
 logger = logging.getLogger("mlenergy.llm.lean")
@@ -131,22 +134,6 @@ class BenchmarkMetrics:
 
 
 @dataclass
-class RequestOutput:
-    """Per-request outcome including latency and token metrics."""
-
-    prompt: str | list[str] = ""
-    output_text: str = ""
-    reasoning_output_text: str = ""
-    prompt_len: int = 0
-    output_tokens: int = 0
-    success: bool = False
-    latency: float = 0.0
-    ttft: float = 0.0
-    itl: list[float] = field(default_factory=list)
-    error: str = ""
-
-
-@dataclass
 class BenchmarkResult:
     """Full benchmark result including metrics, energy, and per-request details."""
 
@@ -173,8 +160,67 @@ class BenchmarkResult:
             logger.info("%-40s: " + entry.fmt, label, entry.value)
         logger.info(sep)
 
-    def save(self, result_file: Path, args: Args, workload: WorkloadConfig) -> None:
-        data = {
+    def save(
+        self,
+        output_dir: Path,
+        task_dir: Path,
+        config: BenchmarkConfig,
+        workload: WorkloadConfig,
+        run_id: str,
+    ) -> None:
+        """Write all run artifacts and update the task-level runs index.
+
+        output_dir/
+          git.diff       — uncommitted diff at run time (empty = clean)
+          config.json    — workload + traffic + sampling params
+          command.txt    — exact CLI invocation
+          results.json   — metrics, energy, per-request data
+
+        task_dir/
+          runs.json      — one entry per run, for scanning across experiments
+        """
+        # --- Git provenance ---
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+            ).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            git_commit = ""
+
+        try:
+            git_diff = subprocess.check_output(
+                ["git", "diff", "HEAD"], text=True, stderr=subprocess.DEVNULL
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            git_diff = ""
+
+        (output_dir / "git.diff").write_text(git_diff)
+
+        # --- Config snapshot ---
+        t = config.traffic
+        config_data = {
+            "workload": workload.model_dump(exclude={"run_id"}),
+            "traffic": {
+                "request_rate": t.request_rate if t.request_rate < float("inf") else "inf",
+                "burstiness": t.burstiness,
+                "max_concurrency": t.max_concurrency,
+                "max_output_tokens": t.max_output_tokens,
+                "ignore_eos": t.ignore_eos,
+            },
+            "sampling": {
+                "temperature": config.sampling.temperature,
+                "top_p": config.sampling.top_p,
+            },
+        }
+        with open(output_dir / "config.json", "w") as f:
+            json.dump(config_data, f, indent=2, default=str)
+
+        (output_dir / "command.txt").write_text(" ".join(sys.argv))
+
+        # --- Results ---
+        results_data = {
+            "run_id": run_id,
+            "git_commit": git_commit,
             "date": datetime.now().strftime("%Y%m%d-%H%M%S"),
             "model_id": workload.model_id,
             "gpu_model": workload.gpu_model,
@@ -184,10 +230,10 @@ class BenchmarkResult:
             "seed": workload.seed,
             "max_num_seqs": workload.max_num_seqs,
             "max_num_batched_tokens": workload.max_num_batched_tokens,
-            "request_rate": args.request_rate if args.request_rate < float("inf") else "inf",
-            "burstiness": args.burstiness,
-            "max_concurrency": args.max_concurrency,
-            "max_output_tokens": args.max_output_tokens,
+            "request_rate": t.request_rate if t.request_rate < float("inf") else "inf",
+            "burstiness": t.burstiness,
+            "max_concurrency": t.max_concurrency,
+            "max_output_tokens": t.max_output_tokens,
             "metrics": {label: entry.value for label, entry in self.metrics.entries.items()},
             "energy_j": self.energy_j,
             "energy_per_token_j": self.energy_per_token_j,
@@ -204,6 +250,24 @@ class BenchmarkResult:
                 for o in self.per_request
             ],
         }
+        result_file = output_dir / "results.json"
         with open(result_file, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(results_data, f, indent=2)
         logger.info("Saved results to %s", result_file)
+
+        # --- Task-level runs index ---
+        runs_index_file = task_dir / "runs.json"
+        runs_index: list[dict] = []
+        if runs_index_file.exists():
+            with open(runs_index_file) as f:
+                runs_index = json.load(f)
+        runs_index.append({
+            "run_id": run_id,
+            "git_commit": git_commit,
+            "model_id": workload.model_id,
+            "gpu_model": workload.gpu_model,
+            **config_data,
+        })
+        with open(runs_index_file, "w") as f:
+            json.dump(runs_index, f, indent=2, default=str)
+        logger.info("Updated runs index at %s", runs_index_file)

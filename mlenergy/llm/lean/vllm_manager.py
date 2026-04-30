@@ -13,139 +13,23 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Final
 
 import yaml
 
 from mlenergy.llm.lean.config import ServerConfig
-
-logger = logging.getLogger("mlenergy.llm.lean")
-
-_STARTUP_STRING: Final[str] = "Application startup complete"
-
-_TERMINATION_STRINGS: Final[frozenset[str]] = frozenset(
-    {
-        "cuda error",
-        "out of memory",
-        "killed",
-        "traceback (most recent call last)",
-        "runtimeerror",
-        "valueerror",
-    }
+from mlenergy.llm.lean.constants import (
+    _CONTAINER_CONFIG_PATH,
+    _CONTAINER_NAME_PREFIX,
+    _CONTAINER_VLLM_CACHE_DIR,
+    _DATA_PARALLEL_ARG,
+    _STARTUP_STRING,
+    _TENSOR_PARALLEL_ARG,
+    _TERMINATION_STRINGS,
+    _VLLM_CONFIG_FILENAME,
+    _VLLM_ENV_FILENAME,
 )
 
-
-def _get_vllm_config_path(config: ServerConfig) -> Path:
-    path = (
-        config.config_base_dir
-        / config.workload
-        / config.model_id
-        / config.gpu_model
-        / "monolithic.config.yaml"
-    ).absolute()
-    if not path.exists():
-        raise FileNotFoundError(
-            f"vLLM config not found: {path}\n"
-            f"Expected for model={config.model_id}, gpu={config.gpu_model}, workload={config.workload}"
-        )
-    return path
-
-
-def _load_env_vars(config: ServerConfig) -> dict[str, str]:
-    path = (
-        config.config_base_dir
-        / config.workload
-        / config.model_id
-        / config.gpu_model
-        / "monolithic.env.yaml"
-    )
-    if not path.exists():
-        return {}
-    with open(path) as f:
-        env_vars = yaml.safe_load(f) or {}
-    return {k: str(v) for k, v in env_vars.items()}
-
-
-def _detect_parallelism(config_text: str) -> tuple[str, int, int]:
-    """Return (parallel_arg, num_gpus, max_num_seqs_divisor) from config text."""
-    if "data-parallel-size" in config_text:
-        return "--data-parallel-size", 1, 1
-    return "--tensor-parallel-size", 1, 1
-
-
-def _build_docker_command(
-    config: ServerConfig,
-    config_path: Path,
-    env_vars: dict[str, str],
-    hf_token: str,
-    hf_home: str,
-    vllm_cache_dir: str | None,
-    max_num_seqs: int,
-    max_num_batched_tokens: int | None,
-    parallel_arg: str,
-) -> list[str]:
-    container_config_path = "/vllm_config/monolithic.config.yaml"
-    container_name = f"lean-benchmark-vllm-{''.join(str(g) for g in config.gpu_ids)}"
-
-    all_env_vars = {
-        "HF_TOKEN": hf_token,
-        "HF_HOME": hf_home,
-        "VLLM_ENGINE_READY_TIMEOUT_S": "1800",
-        **env_vars,
-    }
-    if vllm_cache_dir:
-        all_env_vars["VLLM_CACHE_DIR"] = vllm_cache_dir
-
-    env_flags: list[str] = []
-    for k, v in all_env_vars.items():
-        env_flags += ["-e", f"{k}={v}"]
-
-    gpu_device_ids = ",".join(str(g) for g in config.gpu_ids)
-    bind_mounts: list[str] = [
-        f"{config_path}:{container_config_path}:ro",
-        f"{hf_home}:{hf_home}",
-    ]
-    if vllm_cache_dir:
-        bind_mounts.append(f"{vllm_cache_dir}:/root/.cache/vllm")
-    volume_flags: list[str] = []
-    for mount in bind_mounts:
-        volume_flags += ["-v", mount]
-
-    vllm_cmd: list[str] = [
-        "vllm",
-        "serve",
-        config.model_id,
-        "--config",
-        container_config_path,
-        "--port",
-        str(config.port),
-        parallel_arg,
-        str(len(config.gpu_ids)),
-        "--max-num-seqs",
-        str(max_num_seqs),
-    ]
-    if max_num_batched_tokens is not None:
-        vllm_cmd += ["--max-num-batched-tokens", str(max_num_batched_tokens)]
-
-    return [
-        "docker",
-        "run",
-        "--rm",
-        "--name",
-        container_name,
-        "--gpus",
-        f'"device={gpu_device_ids}"',
-        "--ipc",
-        "host",
-        "--net",
-        "host",
-        "--entrypoint",
-        "",
-        *env_flags,
-        *volume_flags,
-        config.image,
-        *vllm_cmd,
-    ]
+logger = logging.getLogger("mlenergy.llm.lean")
 
 
 class VLLMManager:
@@ -182,21 +66,18 @@ class VLLMManager:
         hf_home = os.environ["HF_HOME"]
         vllm_cache_dir = os.environ.get("VLLM_CACHE_DIR")
 
-        vllm_config_path = _get_vllm_config_path(self._config)
-        env_vars = _load_env_vars(self._config)
+        vllm_config_path = self._get_vllm_config_path()
+        env_vars = self._load_env_vars()
 
         config_text = vllm_config_path.read_text()
-        parallel_arg, _, _ = _detect_parallelism(config_text)
+        parallel_arg = _DATA_PARALLEL_ARG if _DATA_PARALLEL_ARG.lstrip("-") in config_text else _TENSOR_PARALLEL_ARG
 
-        cmd = _build_docker_command(
-            config=self._config,
+        cmd = self._build_docker_command(
             config_path=vllm_config_path,
             env_vars=env_vars,
             hf_token=hf_token,
             hf_home=hf_home,
             vllm_cache_dir=vllm_cache_dir,
-            max_num_seqs=self._max_num_seqs,
-            max_num_batched_tokens=self._max_num_batched_tokens,
             parallel_arg=parallel_arg,
         )
 
@@ -247,6 +128,97 @@ class VLLMManager:
                 f"Check logs at {self._log_path}"
             )
         logger.info("vLLM is ready.")
+
+    def _get_vllm_config_path(self) -> Path:
+        config = self._config
+        path = (
+            config.config_base_dir
+            / config.workload
+            / config.model_id
+            / config.gpu_model
+            / _VLLM_CONFIG_FILENAME
+        ).absolute()
+        if not path.exists():
+            raise FileNotFoundError(
+                f"vLLM config not found: {path}\n"
+                f"Expected for model={config.model_id}, gpu={config.gpu_model}, workload={config.workload}"
+            )
+        return path
+
+    def _load_env_vars(self) -> dict[str, str]:
+        config = self._config
+        path = (
+            config.config_base_dir
+            / config.workload
+            / config.model_id
+            / config.gpu_model
+            / _VLLM_ENV_FILENAME
+        )
+        if not path.exists():
+            return {}
+        with open(path) as f:
+            env_vars = yaml.safe_load(f) or {}
+        return {k: str(v) for k, v in env_vars.items()}
+
+    def _build_docker_command(
+        self,
+        config_path: Path,
+        env_vars: dict[str, str],
+        hf_token: str,
+        hf_home: str,
+        vllm_cache_dir: str | None,
+        parallel_arg: str,
+    ) -> list[str]:
+        config = self._config
+        container_name = f"{_CONTAINER_NAME_PREFIX}{''.join(str(g) for g in config.gpu_ids)}"
+
+        all_env_vars = {
+            "HF_TOKEN": hf_token,
+            "HF_HOME": hf_home,
+            "VLLM_ENGINE_READY_TIMEOUT_S": str(int(config.ready_timeout_s)),
+            **env_vars,
+        }
+        if vllm_cache_dir:
+            all_env_vars["VLLM_CACHE_DIR"] = vllm_cache_dir
+
+        env_flags: list[str] = []
+        for k, v in all_env_vars.items():
+            env_flags += ["-e", f"{k}={v}"]
+
+        gpu_device_ids = ",".join(str(g) for g in config.gpu_ids)
+        bind_mounts: list[str] = [
+            f"{config_path}:{_CONTAINER_CONFIG_PATH}:ro",
+            f"{hf_home}:{hf_home}",
+        ]
+        if vllm_cache_dir:
+            bind_mounts.append(f"{vllm_cache_dir}:{_CONTAINER_VLLM_CACHE_DIR}")
+        volume_flags: list[str] = []
+        for mount in bind_mounts:
+            volume_flags += ["-v", mount]
+
+        vllm_cmd: list[str] = [
+            "vllm", "serve", config.model_id,
+            f"--config={_CONTAINER_CONFIG_PATH}",
+            f"--port={config.port}",
+            f"{parallel_arg}={len(config.gpu_ids)}",
+            f"--max-num-seqs={self._max_num_seqs}",
+        ]
+        if self._max_num_batched_tokens is not None:
+            vllm_cmd.append(f"--max-num-batched-tokens={self._max_num_batched_tokens}")
+
+        return [
+            "docker", "run",
+            "--rm",
+            f"--name={container_name}",
+            "--gpus", f'"device={gpu_device_ids}"',
+            "--ipc=host",
+            "--net=host",
+            "--entrypoint", "",
+            *env_flags,
+            *volume_flags,
+            config.image,
+            *vllm_cmd,
+        ]
 
     def _validate_still_running(self) -> None:
         if self._proc is not None and self._proc.returncode is not None:

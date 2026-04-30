@@ -13,8 +13,7 @@ from abc import ABC, abstractmethod
 
 from zeus.monitor import ZeusMonitor
 
-_GPU_INTERVAL_S: float = 0.1
-_CPU_INTERVAL_S: float = 0.1
+from mlenergy.llm.lean.constants import _CPU_INTERVAL_S, _GPU_INTERVAL_S
 
 
 class PowerSampler(ABC):

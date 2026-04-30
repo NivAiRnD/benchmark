@@ -16,18 +16,33 @@ import json
 import time
 import traceback
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
 import numpy as np
 
-from mlenergy.llm.lean.metrics import RequestOutput
 from mlenergy.llm.lean.tracker import RequestTracker
 
 if TYPE_CHECKING:
     from mlenergy.llm.datasets import SampleRequest
     from mlenergy.llm.lean.config import BenchmarkConfig
+
+
+@dataclass
+class RequestOutput:
+    """Per-request outcome including latency and token metrics."""
+
+    prompt: str | list[str] = ""
+    output_text: str = ""
+    reasoning_output_text: str = ""
+    prompt_len: int = 0
+    output_tokens: int = 0
+    success: bool = False
+    latency: float = 0.0
+    ttft: float = 0.0
+    itl: list[float] = field(default_factory=list)
+    error: str = ""
 
 
 @dataclass
