@@ -33,8 +33,8 @@ from typing import Generic, Literal, TypeVar
 import tyro
 
 from mlenergy.llm.lean.benchmark import Benchmark
-from mlenergy.llm.lean.config import build_config
-from mlenergy.llm.lean.metrics import BenchmarkResult, save_result
+from mlenergy.llm.lean.config import BenchmarkConfig
+from mlenergy.llm.lean.metrics import BenchmarkResult
 from mlenergy.llm.workloads import (
     GPQA,
     LengthControl,
@@ -121,7 +121,7 @@ def main(args: Args) -> None:
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(65535, hard), hard))
 
     requests = workload.load_requests()
-    config = build_config(args, workload, gpu_ids)
+    config = BenchmarkConfig.from_args(args, workload, gpu_ids)
 
     gc.collect()
     gc.freeze()
@@ -139,7 +139,7 @@ def main(args: Args) -> None:
 
     result = asyncio.run(_run())
 
-    save_result(result_file, args, workload, result)
+    result.save(result_file, args, workload)
 
 
 if __name__ == "__main__":

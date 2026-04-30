@@ -20,8 +20,6 @@ import contextlib
 import logging
 import random
 import time
-from collections.abc import AsyncGenerator
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -31,10 +29,10 @@ from zeus.monitor import ZeusMonitor
 
 from mlenergy.llm.datasets import SampleRequest
 from mlenergy.llm.lean.config import BenchmarkConfig
-from mlenergy.llm.lean.metrics import BenchmarkResult, RequestOutput, calculate_metrics
+from mlenergy.llm.lean.metrics import BenchmarkMetrics, BenchmarkResult, RequestOutput
 from mlenergy.llm.lean.power import CPUPowerSampler, GPUPowerSampler, PowerSampler
 from mlenergy.llm.lean.prometheus import PrometheusCollector
-from mlenergy.llm.lean.request import build_requests, dispatch
+from mlenergy.llm.lean.request import RequestInput
 from mlenergy.llm.lean.tracker import RequestTracker
 from mlenergy.llm.lean.vllm_manager import VLLMManager
 
@@ -55,7 +53,13 @@ _PROMETHEUS_INTERVAL_S: Final[float] = 1.0
 
 
 class _ManagedDeps:
-    """All dependencies for a benchmark run.
+    """Long-lived infrastructure that persists across all benchmark runs.
+
+    These dependencies are entered once in Benchmark.__aenter__ and remain
+    active for the entire Benchmark lifetime — including across multiple
+    run() calls.  They represent the mandatory substrate that must be up
+    before any measurement can happen: the vLLM server, the Prometheus
+    scraper, and the HTTP session.
 
     Encapsulates construction order and the ready_event wiring between
     VLLMManager and PrometheusCollector.  Iterable over the three async
@@ -101,25 +105,39 @@ class _ManagedDeps:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
 class _RunContext:
-    """Async context manager for a single benchmark run.
+    """Measurement window for a single benchmark run.
 
-    __aenter__: records start time, opens Zeus energy window.
-    __aexit__:  closes Zeus window, computes metrics, builds BenchmarkResult, validates completion.
+    Opened and closed once per run() call, independently of the long-lived
+    _ManagedDeps infrastructure.  The window is intentionally tight: it starts
+    the moment requests are dispatched and ends when all tasks complete, so
+    energy and timing measurements exclude server startup and idle overhead.
+
+    __aenter__: records start time, opens Zeus energy window, starts power samplers.
+    __aexit__:  stops power samplers, closes Zeus window, computes metrics,
+                builds BenchmarkResult, validates completion.
     """
 
-    tracker: RequestTracker
-    semaphore: asyncio.Semaphore | contextlib.AbstractAsyncContextManager
-    requests: list[SampleRequest]
-    zeus: ZeusMonitor
-    prometheus: PrometheusCollector
-    power_sampler: PowerSampler
-    cpu_sampler: CPUPowerSampler | None
-    tokenizer: PreTrainedTokenizerBase
-    outputs: list[RequestOutput] = field(default_factory=list)
-    result: BenchmarkResult | None = None
-    _benchmark_start: float = field(default=0.0, init=False)
+    def __init__(
+        self,
+        requests: list[SampleRequest],
+        deps: _ManagedDeps,
+        tokenizer: PreTrainedTokenizerBase,
+        max_concurrency: int | None,
+    ) -> None:
+        self.requests = requests
+        self.tracker = RequestTracker(total=len(requests))
+        self.semaphore: asyncio.Semaphore | contextlib.AbstractAsyncContextManager = (
+            asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
+        )
+        self.zeus = deps.zeus
+        self.prometheus = deps.prometheus
+        self.power_sampler = deps.power_sampler
+        self.cpu_sampler = deps.cpu_sampler
+        self.tokenizer = tokenizer
+        self.outputs: list[RequestOutput] = []
+        self.result: BenchmarkResult | None = None
+        self._benchmark_start: float = 0.0
 
     async def __aenter__(self) -> _RunContext:
         self._benchmark_start = time.time()
@@ -141,7 +159,7 @@ class _RunContext:
         zeus_measurement = self.zeus.end_window("benchmark", sync_execution=False)
         benchmark_end = time.time()
 
-        metrics, completed, _ = calculate_metrics(
+        metrics, completed, _ = BenchmarkMetrics.calculate(
             requests=self.requests,
             outputs=self.outputs,
             tokenizer=self.tokenizer,
@@ -240,10 +258,10 @@ class Benchmark:
         np.random.seed(self._config.seed)
 
         api_url = f"{self._config.server.base_url()}/v1/chat/completions"
-        request_inputs = build_requests(self._config, requests, api_url)
+        request_inputs = RequestInput.build_all(self._config, requests, api_url)
 
-        async with self._measurement_window(requests) as ctx:
-            ctx.outputs = await dispatch(
+        async with _RunContext(requests, self._deps, self._tokenizer, self._config.traffic.max_concurrency) as ctx:
+            ctx.outputs = await RequestInput.dispatch_all(
                 requests=request_inputs,
                 request_rate=self._config.traffic.request_rate,
                 burstiness=self._config.traffic.burstiness,
@@ -254,24 +272,3 @@ class Benchmark:
 
         assert ctx.result is not None
         return ctx.result
-
-    @contextlib.asynccontextmanager
-    async def _measurement_window(
-        self, requests: list[SampleRequest]
-    ) -> AsyncGenerator[_RunContext, None]:
-        ctx = _RunContext(
-            tracker=RequestTracker(total=len(requests)),
-            semaphore=(
-                asyncio.Semaphore(self._config.traffic.max_concurrency)
-                if self._config.traffic.max_concurrency
-                else contextlib.nullcontext()
-            ),
-            requests=requests,
-            zeus=self._deps.zeus,
-            prometheus=self._deps.prometheus,
-            power_sampler=self._deps.power_sampler,
-            cpu_sampler=self._deps.cpu_sampler,
-            tokenizer=self._tokenizer,
-        )
-        async with ctx:
-            yield ctx

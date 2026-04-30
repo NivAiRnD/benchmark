@@ -46,11 +46,88 @@ class BenchmarkMetrics:
     Access by name:  metrics.entries["Completed requests"].value
     Iterate for log: for label, entry in metrics.entries.items(): ...
 
-    Add new metrics in calculate_metrics — logging and serialization
+    Add new metrics in BenchmarkMetrics.calculate — logging and serialization
     traverse entries automatically.
     """
 
     entries: dict[str, MetricEntry]
+
+    @classmethod
+    def calculate(
+        cls,
+        requests: list[SampleRequest],
+        outputs: list[RequestOutput],
+        tokenizer: PreTrainedTokenizerBase,
+        duration_s: float,
+    ) -> tuple[BenchmarkMetrics, int, list[int]]:
+        """Reduce raw request outputs into aggregate benchmark metrics.
+
+        Returns:
+            metrics: Named entries for display and serialization.
+            completed: Count of successful requests, for validation in the caller.
+            actual_output_lens: Per-request output token counts (0 for failures).
+        """
+        actual_output_lens: list[int] = []
+        total_input = 0
+        completed = 0
+        ttfts: list[float] = []
+        tpots: list[float] = []
+        e2els: list[float] = []
+
+        for req, out in zip(requests, outputs):
+            if not out.success:
+                actual_output_lens.append(0)
+                continue
+
+            output_len = out.output_tokens or len(
+                tokenizer(
+                    out.output_text + out.reasoning_output_text,
+                    add_special_tokens=False,
+                ).input_ids
+            )
+            actual_output_lens.append(output_len)
+            total_input += req.prompt_len
+            ttfts.append(out.ttft)
+            e2els.append(out.latency)
+            if output_len > 1:
+                tpots.append((out.latency - out.ttft) / (output_len - 1))
+            completed += 1
+
+        if completed == 0:
+            warnings.warn(
+                "All requests failed — check benchmark configuration.", stacklevel=2
+            )
+
+        def _ms(arr: list[float], fn: Any) -> float:
+            return float(fn(arr or [0]) * 1000)
+
+        def _p(arr: list[float], p: float) -> float:
+            return float(np.percentile(arr or [0], p) * 1000)
+
+        total_output = sum(actual_output_lens)
+
+        entries: dict[str, MetricEntry] = {
+            "Completed requests": MetricEntry(completed, "%d"),
+            "Duration (s)": MetricEntry(duration_s),
+            "Total input tokens": MetricEntry(total_input, "%d"),
+            "Total output tokens": MetricEntry(total_output, "%d"),
+            "Request throughput (req/s)": MetricEntry(completed / duration_s),
+            "Output throughput (tok/s)": MetricEntry(total_output / duration_s),
+            "Total token throughput (tok/s)": MetricEntry(
+                (total_input + total_output) / duration_s
+            ),
+            "Mean TTFT (ms)": MetricEntry(_ms(ttfts, np.mean)),
+            "Median TTFT (ms)": MetricEntry(_ms(ttfts, np.median)),
+            "P90 TTFT (ms)": MetricEntry(_p(ttfts, 90)),
+            "P99 TTFT (ms)": MetricEntry(_p(ttfts, 99)),
+            "Mean TPOT (ms)": MetricEntry(_ms(tpots, np.mean)),
+            "P90 TPOT (ms)": MetricEntry(_p(tpots, 90)),
+            "Mean E2EL (ms)": MetricEntry(_ms(e2els, np.mean)),
+            "Median E2EL (ms)": MetricEntry(_ms(e2els, np.median)),
+            "P90 E2EL (ms)": MetricEntry(_p(e2els, 90)),
+            "P99 E2EL (ms)": MetricEntry(_p(e2els, 99)),
+        }
+        return cls(entries=entries), completed, actual_output_lens
 
 
 @dataclass
@@ -96,124 +173,37 @@ class BenchmarkResult:
             logger.info("%-40s: " + entry.fmt, label, entry.value)
         logger.info(sep)
 
-
-# ---------------------------------------------------------------------------
-# Calculation
-# ---------------------------------------------------------------------------
-
-
-def calculate_metrics(
-    requests: list[SampleRequest],
-    outputs: list[RequestOutput],
-    tokenizer: PreTrainedTokenizerBase,
-    duration_s: float,
-) -> tuple[BenchmarkMetrics, int, list[int]]:
-    """Reduce raw request outputs into aggregate benchmark metrics.
-
-    Returns:
-        metrics: Named entries for display and serialization.
-        completed: Count of successful requests, for validation in the caller.
-        actual_output_lens: Per-request output token counts (0 for failures).
-    """
-    actual_output_lens: list[int] = []
-    total_input = 0
-    completed = 0
-    ttfts: list[float] = []
-    tpots: list[float] = []
-    e2els: list[float] = []
-
-    for req, out in zip(requests, outputs):
-        if not out.success:
-            actual_output_lens.append(0)
-            continue
-
-        output_len = out.output_tokens or len(
-            tokenizer(
-                out.output_text + out.reasoning_output_text,
-                add_special_tokens=False,
-            ).input_ids
-        )
-        actual_output_lens.append(output_len)
-        total_input += req.prompt_len
-        ttfts.append(out.ttft)
-        e2els.append(out.latency)
-        if output_len > 1:
-            tpots.append((out.latency - out.ttft) / (output_len - 1))
-        completed += 1
-
-    if completed == 0:
-        warnings.warn(
-            "All requests failed — check benchmark configuration.", stacklevel=2
-        )
-
-    def _ms(arr: list[float], fn: Any) -> float:
-        return float(fn(arr or [0]) * 1000)
-
-    def _p(arr: list[float], p: float) -> float:
-        return float(np.percentile(arr or [0], p) * 1000)
-
-    total_output = sum(actual_output_lens)
-
-    entries: dict[str, MetricEntry] = {
-        "Completed requests": MetricEntry(completed, "%d"),
-        "Duration (s)": MetricEntry(duration_s),
-        "Total input tokens": MetricEntry(total_input, "%d"),
-        "Total output tokens": MetricEntry(total_output, "%d"),
-        "Request throughput (req/s)": MetricEntry(completed / duration_s),
-        "Output throughput (tok/s)": MetricEntry(total_output / duration_s),
-        "Total token throughput (tok/s)": MetricEntry(
-            (total_input + total_output) / duration_s
-        ),
-        "Mean TTFT (ms)": MetricEntry(_ms(ttfts, np.mean)),
-        "Median TTFT (ms)": MetricEntry(_ms(ttfts, np.median)),
-        "P90 TTFT (ms)": MetricEntry(_p(ttfts, 90)),
-        "P99 TTFT (ms)": MetricEntry(_p(ttfts, 99)),
-        "Mean TPOT (ms)": MetricEntry(_ms(tpots, np.mean)),
-        "P90 TPOT (ms)": MetricEntry(_p(tpots, 90)),
-        "Mean E2EL (ms)": MetricEntry(_ms(e2els, np.mean)),
-        "Median E2EL (ms)": MetricEntry(_ms(e2els, np.median)),
-        "P90 E2EL (ms)": MetricEntry(_p(e2els, 90)),
-        "P99 E2EL (ms)": MetricEntry(_p(e2els, 99)),
-    }
-    return BenchmarkMetrics(entries=entries), completed, actual_output_lens
-
-
-def save_result(
-    result_file: Path,
-    args: Args,
-    workload: WorkloadConfig,
-    result: BenchmarkResult,
-) -> None:
-    data = {
-        "date": datetime.now().strftime("%Y%m%d-%H%M%S"),
-        "model_id": workload.model_id,
-        "gpu_model": workload.gpu_model,
-        "num_gpus": workload.num_gpus,
-        "num_requests": workload.num_requests,
-        "num_request_repeats": workload.num_request_repeats,
-        "seed": workload.seed,
-        "max_num_seqs": workload.max_num_seqs,
-        "max_num_batched_tokens": workload.max_num_batched_tokens,
-        "request_rate": args.request_rate if args.request_rate < float("inf") else "inf",
-        "burstiness": args.burstiness,
-        "max_concurrency": args.max_concurrency,
-        "max_output_tokens": args.max_output_tokens,
-        "metrics": {label: entry.value for label, entry in result.metrics.entries.items()},
-        "energy_j": result.energy_j,
-        "energy_per_token_j": result.energy_per_token_j,
-        "prometheus_stats": result.prometheus_stats,
-        "power_trace": result.power_trace,
-        "cpu_power_trace": result.cpu_power_trace,
-        "per_request": [
-            {
-                "ttft": o.ttft,
-                "latency": o.latency,
-                "output_tokens": o.output_tokens,
-                "success": o.success,
-            }
-            for o in result.per_request
-        ],
-    }
-    with open(result_file, "w") as f:
-        json.dump(data, f, indent=2)
-    logger.info("Saved results to %s", result_file)
+    def save(self, result_file: Path, args: Args, workload: WorkloadConfig) -> None:
+        data = {
+            "date": datetime.now().strftime("%Y%m%d-%H%M%S"),
+            "model_id": workload.model_id,
+            "gpu_model": workload.gpu_model,
+            "num_gpus": workload.num_gpus,
+            "num_requests": workload.num_requests,
+            "num_request_repeats": workload.num_request_repeats,
+            "seed": workload.seed,
+            "max_num_seqs": workload.max_num_seqs,
+            "max_num_batched_tokens": workload.max_num_batched_tokens,
+            "request_rate": args.request_rate if args.request_rate < float("inf") else "inf",
+            "burstiness": args.burstiness,
+            "max_concurrency": args.max_concurrency,
+            "max_output_tokens": args.max_output_tokens,
+            "metrics": {label: entry.value for label, entry in self.metrics.entries.items()},
+            "energy_j": self.energy_j,
+            "energy_per_token_j": self.energy_per_token_j,
+            "prometheus_stats": self.prometheus_stats,
+            "power_trace": self.power_trace,
+            "cpu_power_trace": self.cpu_power_trace,
+            "per_request": [
+                {
+                    "ttft": o.ttft,
+                    "latency": o.latency,
+                    "output_tokens": o.output_tokens,
+                    "success": o.success,
+                }
+                for o in self.per_request
+            ],
+        }
+        with open(result_file, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info("Saved results to %s", result_file)
