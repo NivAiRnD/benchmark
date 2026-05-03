@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 
 from zeus.monitor import ZeusMonitor
 
-from mlenergy.llm.lean.constants import _CPU_INTERVAL_S, _GPU_INTERVAL_S
+from mlenergy.llm.lean.constants import HardwareMonitorDefaults
 
 
 class PowerSampler(ABC):
@@ -67,7 +67,7 @@ class PowerSampler(ABC):
 class GPUPowerSampler(PowerSampler):
     """Polls instant GPU power via Zeus."""
 
-    def __init__(self, zeus: ZeusMonitor, interval: float = _GPU_INTERVAL_S) -> None:
+    def __init__(self, zeus: ZeusMonitor, interval: float = HardwareMonitorDefaults.GPU_INTERVAL_S) -> None:
         super().__init__(zeus, interval)
 
     def _read_watts(self) -> float:
@@ -80,7 +80,7 @@ class GPUPowerSampler(PowerSampler):
 class CPUPowerSampler(PowerSampler):
     """Polls CPU power via RAPL using delta-energy / delta-time."""
 
-    def __init__(self, zeus: ZeusMonitor, interval: float = _CPU_INTERVAL_S) -> None:
+    def __init__(self, zeus: ZeusMonitor, interval: float = HardwareMonitorDefaults.CPU_INTERVAL_S) -> None:
         super().__init__(zeus, interval)
         self._prev_energy_j: float = 0.0
         self._prev_time: float = 0.0

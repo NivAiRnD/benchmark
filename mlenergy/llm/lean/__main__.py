@@ -25,18 +25,19 @@ Monitor in a second terminal::
     find run/llm -name "server.log" | xargs tail -f
 """
 
-import asyncio
-import gc
-import logging
+
 import os
-import resource
+import gc
+import tyro
+import logging
+import asyncio
 import tomllib
+import resource
+
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Generic, Literal, TypeVar
-
-import tyro
 
 from mlenergy.llm.lean.benchmark import Benchmark
 from mlenergy.llm.lean.config import BenchmarkConfig
@@ -51,7 +52,7 @@ from mlenergy.llm.lean.workloads import (
 
 WorkloadT = TypeVar("WorkloadT", bound=LeanWorkloadMixin)
 
-logger = logging.getLogger("mlenergy.llm.lean")
+logger = logging.getLogger(__spec__.parent)
 
 _WORKLOAD_TYPES: dict[str, type[LeanWorkloadMixin]] = {
     "lm-arena-chat": LMArenaChat,
@@ -105,27 +106,29 @@ def _workload_from_toml(data: dict) -> LeanWorkloadMixin:
     return cls(**data)
 
 
-def main(args: Args) -> None:
+def _resolve_workload(args: Args) -> LeanWorkloadMixin:
     if args.workload is not None:
-        workload = args.workload
-    elif args.config is not None:
+        return args.workload
+    if args.config is not None:
         with open(args.config, "rb") as f:
             toml_data = tomllib.load(f)
         if "workload" not in toml_data:
             raise ValueError(f"--config provided but [{args.config}] has no [workload] section")
-        workload = _workload_from_toml(toml_data["workload"])
-    else:
-        raise ValueError("Must provide either a workload subcommand or --config with a [workload] section")
+        return _workload_from_toml(toml_data["workload"])
+    raise ValueError("Must provide either a workload subcommand or --config with a [workload] section")
 
+
+def _validate_gpus(workload: LeanWorkloadMixin) -> list[int]:
     gpu_ids = [int(g) for g in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
     if len(gpu_ids) != workload.num_gpus:
         raise ValueError(
             f"workload.num_gpus={workload.num_gpus} does not match "
             f"CUDA_VISIBLE_DEVICES ({len(gpu_ids)} GPUs: {os.environ['CUDA_VISIBLE_DEVICES']})"
         )
+    return gpu_ids
 
-    workload.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
 
+def _setup_logging(workload: LeanWorkloadMixin, args: Args) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s:%(lineno)d] %(message)s",
@@ -137,7 +140,27 @@ def main(args: Args) -> None:
     )
     logger.info("%s", args)
 
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+async def _run_benchmark(config: BenchmarkConfig, workload: LeanWorkloadMixin, requests, monitor_cpu_power: bool) -> BenchmarkResult:
+    async with Benchmark(
+        config=config,
+        output_dir=workload.run_dir,
+        max_num_seqs=workload.max_num_seqs,
+        tokenizer=workload.tokenizer,
+        max_num_batched_tokens=workload.max_num_batched_tokens,
+        monitor_cpu_power=monitor_cpu_power,
+    ) as bm:
+        return await bm.run(requests)
+
+
+def main(args: Args) -> None:
+    workload = _resolve_workload(args)
+    gpu_ids = _validate_gpus(workload)
+
+    workload.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    _setup_logging(workload, args)
+
+    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (min(65535, hard), hard))
 
     requests = workload.load_requests()
@@ -146,22 +169,9 @@ def main(args: Args) -> None:
     gc.collect()
     gc.freeze()
 
-    async def _run() -> BenchmarkResult:
-        async with Benchmark(
-            config=config,
-            output_dir=workload.run_dir,
-            max_num_seqs=workload.max_num_seqs,
-            tokenizer=workload.tokenizer,
-            max_num_batched_tokens=workload.max_num_batched_tokens,
-            monitor_cpu_power=args.monitor_cpu_power,
-        ) as bm:
-            return await bm.run(requests)
+    result = asyncio.run(_run_benchmark(config, workload, requests, args.monitor_cpu_power))
 
-    result = asyncio.run(_run())
-
-    output_dir = workload.run_dir
-    task_dir = workload.base_dir / workload.normalized_name
-    result.save(output_dir, task_dir, config, workload, workload.run_id)
+    result.save(workload.run_dir, workload.base_dir / workload.normalized_name, config, workload, workload.run_id)
 
 
 if __name__ == "__main__":

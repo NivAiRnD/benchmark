@@ -10,17 +10,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
-from mlenergy.llm.lean.constants import (
-    _CONFIG_BASE_DIR,
-    _DEFAULT_READY_TIMEOUT_S,
-    _DEFAULT_VLLM_IMAGE,
-)
+from mlenergy.llm.lean.constants import VLLMDefaults
 
 if TYPE_CHECKING:
     from mlenergy.llm.lean.__main__ import Args
     from mlenergy.llm.workloads import WorkloadConfig
 
-logger = logging.getLogger("mlenergy.llm.lean")
+logger = logging.getLogger(__name__)
 
 OutputTokens: TypeAlias = int | Literal["dataset"] | None
 
@@ -44,10 +40,10 @@ class ServerConfig:
     gpu_model: str
     workload: str
     gpu_ids: list[int]
-    image: str = _DEFAULT_VLLM_IMAGE
+    image: str = VLLMDefaults.IMAGE
     port: int = 8000
-    ready_timeout_s: float = _DEFAULT_READY_TIMEOUT_S
-    config_base_dir: Path = _CONFIG_BASE_DIR
+    ready_timeout_s: float = VLLMDefaults.READY_TIMEOUT_S
+    config_base_dir: Path = VLLMDefaults.CONFIG_BASE_DIR
 
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
@@ -174,7 +170,7 @@ class BenchmarkConfig:
                 gpu_model=workload.gpu_model,
                 workload=workload.normalized_name,
                 gpu_ids=gpu_ids,
-                image=pick(args.server_image, base.server.image if base else _DEFAULT_VLLM_IMAGE),
+                image=pick(args.server_image, base.server.image if base else VLLMDefaults.IMAGE),
             ),
             traffic=TrafficConfig(
                 request_rate=pick(args.request_rate, bt.request_rate),

@@ -15,9 +15,9 @@ from typing import Any, Literal
 
 import aiohttp
 
-from mlenergy.llm.lean.constants import _DEFAULT_PERCENTILES, _SCRAPE_TIMEOUT_S
+from mlenergy.llm.lean.constants import PrometheusDefaults
 
-logger = logging.getLogger("mlenergy.llm.lean")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -59,7 +59,7 @@ class PrometheusCollector:
     async def __aenter__(self) -> PrometheusCollector:
         self._stop = asyncio.Event()
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=_SCRAPE_TIMEOUT_S)
+            timeout=aiohttp.ClientTimeout(total=PrometheusDefaults.SCRAPE_TIMEOUT_S)
         )
         self._collect_task = asyncio.create_task(self._collect())
         logger.info(
@@ -95,7 +95,7 @@ class PrometheusCollector:
         window_end: float,
         gauge_metrics: dict[str, Literal["sum", "avg", "max"]],
         histogram_metrics: list[str] | None = None,
-        percentiles: tuple[float, ...] = _DEFAULT_PERCENTILES,
+        percentiles: tuple[float, ...] = PrometheusDefaults.DEFAULT_PERCENTILES,
     ) -> dict[str, float]:
         """Compute statistics over snapshots within [window_start, window_end].
 

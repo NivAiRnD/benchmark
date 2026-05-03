@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from mlenergy.llm.lean.config import BenchmarkConfig
     from mlenergy.llm.workloads import WorkloadConfig
 
-logger = logging.getLogger("mlenergy.llm.lean")
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

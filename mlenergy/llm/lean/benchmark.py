@@ -6,7 +6,7 @@ Usage::
         result = await bm.run(requests)
 
 The Benchmark context manager composes all sub-managers (vLLM container,
-Prometheus scraper, aiohttp session) via AsyncExitStack so cleanup is always
+PrometheusDefaults scraper, aiohttp session) via AsyncExitStack so cleanup is always
 LIFO and automatic regardless of errors.
 
 Measurement window: from the moment the first task is dispatched to the moment
@@ -29,26 +29,26 @@ from zeus.monitor import ZeusMonitor
 
 from mlenergy.llm.datasets import SampleRequest
 from mlenergy.llm.lean.config import BenchmarkConfig
-from mlenergy.llm.lean.constants import _AIOHTTP_TIMEOUT_S, _PROMETHEUS_INTERVAL_S
+from mlenergy.llm.lean.constants import PrometheusDefaults, RequestClientDefaults
 from mlenergy.llm.lean.metrics import BenchmarkMetrics, BenchmarkResult
 from mlenergy.llm.lean.power import CPUPowerSampler, GPUPowerSampler
 from mlenergy.llm.lean.prometheus import PrometheusCollector
 from mlenergy.llm.lean.request import RequestInput, RequestOutput
 from mlenergy.llm.lean.tracker import RequestTracker
-from mlenergy.llm.lean.vllm_manager import VLLMManager
+from mlenergy.llm.lean.vllm_runner import VLLMRunner
 
 if TYPE_CHECKING:
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-logger = logging.getLogger("mlenergy.llm.lean")
+logger = logging.getLogger(__name__)
 
-_AIOHTTP_TIMEOUT: Final[aiohttp.ClientTimeout] = aiohttp.ClientTimeout(total=_AIOHTTP_TIMEOUT_S)
+_AIOHTTP_TIMEOUT: Final[aiohttp.ClientTimeout] = aiohttp.ClientTimeout(total=RequestClientDefaults.TIMEOUT_S)
 
 
 class Benchmark:
     """Async context manager for the full benchmark lifecycle.
 
-    Owns all sub-managers (vLLM container, Prometheus scraper, aiohttp session)
+    Owns all sub-managers (vLLM container, PrometheusDefaults scraper, aiohttp session)
     and enters/exits them via AsyncExitStack — cleanup is LIFO and automatic.
 
     Usage::
@@ -63,11 +63,11 @@ class Benchmark:
         These dependencies are entered once in Benchmark.__aenter__ and remain
         active for the entire Benchmark lifetime — including across multiple
         run() calls.  They represent the mandatory substrate that must be up
-        before any measurement can happen: the vLLM server, the Prometheus
+        before any measurement can happen: the vLLM server, the PrometheusDefaults
         scraper, and the HTTP session.
 
         Encapsulates construction order and the ready_event wiring between
-        VLLMManager and PrometheusCollector.  Iterable over the three async
+        VLLMManager and PrometheusDefaultsCollector.  Iterable over the three async
         context managers so callers can do:
             for dep in self._deps: await stack.enter_async_context(dep)
         """
@@ -80,7 +80,7 @@ class Benchmark:
             max_num_batched_tokens: int | None,
             monitor_cpu_power: bool,
         ) -> None:
-            self.vllm = VLLMManager(
+            self.vllm = VLLMRunner(
                 config=config.server,
                 log_path=log_path,
                 max_num_seqs=max_num_seqs,
@@ -88,7 +88,7 @@ class Benchmark:
             )
             self.prometheus = PrometheusCollector(
                 metrics_url=config.server.base_url() + "/metrics",
-                interval=_PROMETHEUS_INTERVAL_S,
+                interval=PrometheusDefaults.INTERVAL_S,
                 ready_event=self.vllm.ready_event,
             )
             self.session = aiohttp.ClientSession(
